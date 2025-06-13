@@ -56,8 +56,10 @@ class OS{
 
         vector<Process> processList;
 
+        vector<Processor> processor;
+
         mutex mtx;
-        thread processor;
+        thread threadProcessor;
 
     public:
         OS(int c, int m, int d);
@@ -65,4 +67,14 @@ class OS{
         bool createProcess(int memoryRequired, int timeRequired);
 
         void runProcessor();
+};
+
+class Processor{
+    private:
+        Process currentProcess;
+
+    public:
+        Processor();
+
+        void execute(Process process, int quantum);
 };
