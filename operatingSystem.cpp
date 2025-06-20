@@ -1,110 +1,176 @@
 #include "operatingSystem.h"
 
-// Struct Process
+// --- Implementação da Função Auxiliar ---
 
-Process::Process(int id, int mem, int time) : pid(id), memoryRequired(mem), timeRequired(time) {
-    this->state = State::CREATED;
-    std::cout << "Process " << pid << " created with " << memoryRequired << "MB memory required." << std::endl;
+string stateToString(State state) {
+    switch (state) {
+        case State::CREATED: return "CREATED";
+        case State::READY: return "READY";
+        case State::RUNNING: return "RUNNING";
+        case State::BLOCKED: return "BLOCKED";
+        case State::SUSPENDED: return "SUSPENDED";
+        case State::TERMINATED: return "TERMINATED";
+        default: return "UNKNOWN";
+    }
+}
+
+// --- Fim da Implementação da Função Auxiliar ---
+
+// --- Implementação da Classe Process ---
+
+Process::Process(int id, int mem, int time) : pid(id), memoryRequired(mem), timeRequired(time), state(State::CREATED) {
+    cout << "[PID " << pid << "] Processo criado. Memória: " << memoryRequired << "MB, Tempo: " << timeRequired << "s." << endl;
 }
 
 void Process::transitionState(State newState) {
-    std::cout << "Process " << pid << " transitioned from: "<< stateToString(this->state) << " to: " << stateToString(newState) << std::endl;
+    cout << "[PID " << this->pid << "] Transição de Estado: " << stateToString(this->state) << " -> " << stateToString(newState) << endl;
     this->state = newState;
 }
 
-// Class OS
+int Process::getPid() const { return this->pid; }
 
-OS::OS(int c, int m, int d) : cores(c), memory(m), diskSpace(d){
-    std::cout << "Operating System initialized with " << cores << " cores, " << memory << "MB memory, and " << diskSpace << "MB disk space." << std::endl;
+int Process::getMemoryRequired() const { return this->memoryRequired; }
 
-    for(int i =0; i < c; i++) this->processor.push_back(Processor());
+int Process::getTimeRequired() const { return this->timeRequired; }
 
+State Process::getState() const { return this->state; }
+
+void Process::setTimeRequired(int time) { this->timeRequired = time; }
+
+// --- Fim da Implementação da Classe Process ---
+
+// --- Implementação da Classe OS ---
+
+OS::OS(int c, int m, int d) : cores(c), memory(m), diskSpace(d) {
+    cout << "Sistema Operacional inicializado com " << cores << " cores, " << memory << "MB de memória e " << diskSpace << "MB de disco." << endl;
+    
+    schedulerThread = thread(&OS::schedulerLoop, this);
+
+    for (int i = 0; i < this->cores; i++) coreThreads.emplace_back(&OS::coreWorkerLoop, this, i + 1);
 }
 
-bool OS::createProcess(int memoryRequired, int timeRequired){
-    if(this->processIdCounter < 8){
-        if (memoryRequired <= (this->memory - this->memoryUsed)){
-            Process newProcess(this->processIdCounter, memoryRequired, timeRequired);
-            this->memoryUsed += memoryRequired;
-            this->processIdCounter++;
+OS::~OS() {
+    stop();
 
-            processList.push_back(newProcess);
-            return true;
-        }else{
-            for(auto& process : processList){
-                if (process.state == State::BLOCKED){
-                    int sumSpace = process.memoryRequired + (this->memory - this->memoryUsed);
+    if(schedulerThread.joinable()) schedulerThread.join();
+    for(auto& t : coreThreads) if(t.joinable()) t.join();
+}
 
-                    if(sumSpace >= memoryRequired) {
-                        process.state = State::SUSPENDED;
-                        this->memoryUsed -= process.memoryRequired;
-                        this->diskSpaceUsed += process.memoryRequired;
-                        
-                        Process newProcess(this->processIdCounter, memoryRequired, timeRequired);
-                        this->memoryUsed += memoryRequired;
-                        this->processIdCounter++;
+void OS::stop() {
+    if(running){
+        running = false;
+        cv.notify_all();
+    }
+}
 
-                        processList.push_back(newProcess);
-                        return true;
-                    }
+bool OS::createProcess(int memoryRequired, int timeRequired) {
+    lock_guard<mutex> lock(mtx);
+
+    if(this->processIdCounter.empty()){
+        cout << "Limite máximo de processos (8) atingido." << endl;
+        return false;
+    }
+
+    if(memoryRequired <= (this->memory - this->memoryUsed)){
+        processList.emplace_back(this->processIdCounter[0], memoryRequired, timeRequired);
+        this->memoryUsed += memoryRequired;
+        this->processIdCounter.erase(this->processIdCounter.begin());
+        return true;
+    }else{
+        for(auto& process : processList){
+            if(process.getState() == State::BLOCKED){
+                int spaceAfterSuspend = process.getMemoryRequired() + (this->memory - this->memoryUsed);
+                if(spaceAfterSuspend >= memoryRequired){
+                    process.transitionState(State::SUSPENDED);
+                    this->memoryUsed -= process.getMemoryRequired();
+                    this->diskSpaceUsed += process.getMemoryRequired();
+                    
+                    processList.emplace_back(this->processIdCounter[0], memoryRequired, timeRequired);
+                    this->memoryUsed += memoryRequired;
+                    this->processIdCounter.erase(this->processIdCounter.begin());
+                    return true;
                 }
             }
         }
     }
+
+    cout << "Falha ao criar processo: Memória insuficiente." << endl;
     return false;
 }
 
-void Processor::execute(Process process, int quantum) {
-    std::cout << "Executing process " << process.pid << "..." << std::endl;
+void OS::schedulerLoop() {
+    while(running){
+        {
+            lock_guard<mutex> lock(mtx);
+            bool newProcessAdded = false;
 
-    process.transitionState(State::RUNNING);
+            for(auto& process : processList){
+                if(process.getState() == State::CREATED){
+                    process.transitionState(State::READY);
+                    readyQueue.push_back(ref(process));
+                    newProcessAdded = true;
+                }else if(process.getState() == State::SUSPENDED){
+                    if(memoryUsed + process.getMemoryRequired() <= memory){
+                        process.transitionState(State::READY);
+                        readyQueue.push_back(ref(process));
+                        memoryUsed += process.getMemoryRequired();
+                        diskSpaceUsed -= process.getMemoryRequired();
+                        newProcessAdded = true;
+                    }
+                }
+            }
 
-    int timeToRun = min(process.timeRequired, quantum);
-
-    sleep_for(seconds(timeToRun));
-    process.timeRequired -= timeToRun;
-
-    if(process.timeRequired <=0){
-        process.transitionState(State::TERMINATED);
-        this->memoryUsed -= process.memoryRequired;
-        this->processList.erase(remove_if(this->processList.begin(), this->processList.end(), 
-            [&process](const Process& p) { return p.pid == process.pid; }), this->processList.end());
-    } else if (process.timeRequired > 0) {
-        process.transitionState(State::READY);
+            if(newProcessAdded) cv.notify_all();
+        }
+        sleep_for(milliseconds(500));
     }
-
-    std::this_thread::sleep_for(std::chrono::seconds(currentProcess.timeRequired));
-    std::cout << "Process " << currentProcess.pid << " completed." << std::endl;
 }
 
-void OS::runProcessor(){
-    while(this->runnig){
-        int i = 0;
-        for(auto& process : this->processList){
-            if(process.state == State::READY){
+void OS::coreWorkerLoop(int coreId) {
+    cout << "[Core " << coreId << "] Iniciado e pronto para trabalhar." << endl;
+    while(running){
+        Process* processToRun = nullptr;
+        {
+            unique_lock<mutex> lock(mtx);
 
-                
-                processor[i].execute(process, this->quantum);
-                i++;
+            cv.wait(lock, [this] { return !readyQueue.empty() || !running; });
 
-                if(i > this->cores -1){
-                    i = 0;
+            if(!running && readyQueue.empty()) break;
+            
+            if(!readyQueue.empty()){
+                processToRun = &readyQueue.front().get();
+                readyQueue.pop_front();
+            }
+        }
+
+        if(processToRun){
+            executeProcess(*processToRun, coreId);
+            {
+                lock_guard<mutex> lock(mtx);
+                if(processToRun->getTimeRequired() > 0){
+                    processToRun->transitionState(State::READY);
+                    readyQueue.push_back(*processToRun);
+                    cv.notify_one();
+                }else{
+                    processToRun->transitionState(State::TERMINATED);
+                    this->processIdCounter.push_back(processToRun->getPid());
+                    memoryUsed -= processToRun->getMemoryRequired();
+                    cout << "[Core " << coreId << "][PID " << processToRun->getPid() << "] Processo finalizado e memória liberada." << endl;
                 }
-
-                if(process.timeRequired <=0){
-                    process.transitionState(State::TERMINATED);
-                    this->memoryUsed -= process.memoryRequired;
-                    this->processList.erase(remove_if(this->processList.begin(), this->processList.end(), 
-                        [&process](const Process& p) { return p.pid == process.pid; }), this->processList.end());
-                } else if (process.timeRequired > 0) {
-                    process.transitionState(State::READY);
-                }
-            } else if (process.state == State::BLOCKED) {
-                // Simulate some processing time
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                process.transitionState(State::READY);
             }
         }
     }
-    cout << "Processor is stopping." << endl;
+    cout << "[Core " << coreId << "] Encerrando." << endl;
 }
+
+void OS::executeProcess(Process& process, int coreId) {
+    process.transitionState(State::RUNNING);
+    int timeToRun = min(process.getTimeRequired(), this->quantum);
+    cout << "[Core " << coreId << "][PID " << process.getPid() << "] Executando por " << timeToRun << "s (Tempo Restante: " << process.getTimeRequired() << "s)" << endl;
+    
+    sleep_for(seconds(timeToRun));
+
+    process.setTimeRequired(process.getTimeRequired() - timeToRun);
+}
+
+// --- Fim da Implementação da Classe OS ---
